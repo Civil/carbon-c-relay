@@ -21,7 +21,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <glob.h>
-#include <regex.h>
+#include <pcre.h>
 #include <sys/stat.h>
 #include <netdb.h>
 #include <sys/socket.h>
@@ -101,7 +101,8 @@ typedef struct _destinations {
 
 typedef struct _route {
 	char *pattern;    /* original regex input, used for printing only */
-	regex_t rule;     /* regex on metric, only if type == REGEX */
+	pcre *rule;
+	pcre_extra * rule_extra;
 	size_t nmatch;    /* number of match groups */
 	char *strmatch;   /* string to search for if type not REGEX or MATCHALL */
 	destinations *dests; /* where matches should go */
@@ -133,6 +134,8 @@ struct _router {
 
 /* custom constant, meant to force regex mode matching */
 #define REG_FORCE   01000000
+/* custom constant, regex error out of space */
+#define REG_ESPACE  1
 
 /* catch string used for aggrgator destinations */
 #define STUB_AGGR   "_aggregator_stub_"
@@ -227,8 +230,12 @@ static void
 router_free_intern(cluster *clusters, route *routes)
 {
 	while (routes != NULL) {
-		if (routes->matchtype == REGEX)
-			regfree(&routes->rule);
+		if (routes->matchtype == REGEX) {
+			if (routes->rule_extra)
+				pcre_free (routes->rule_extra);
+			if (routes->rule)
+				pcre_free (routes->rule);
+		}
 
 		if (routes->next == NULL || routes->next->dests != routes->dests) {
 			while (routes->dests != NULL) {
@@ -293,11 +300,12 @@ determine_if_regex(route *r, char *pat, int flags)
 	char *e = pat;
 	char *pb = patbuf;
 	char escape = 0;
+	size_t re_nsub = 0;
 	r->matchtype = CONTAINS;
 	r->nmatch = 0;
 
 	if (flags & REG_FORCE) {
-		flags &= ~REG_NOSUB;
+		flags &= ~PCRE_NO_AUTO_CAPTURE;
 		r->matchtype = REGEX;
 	}
 
@@ -360,17 +368,23 @@ determine_if_regex(route *r, char *pat, int flags)
 		r->strmatch = strdup(patbuf);
 		r->pattern = strdup(pat);
 	} else {
-		int ret = regcomp(&r->rule, pat, flags & ~REG_FORCE);
-		if (ret != 0)
-			return ret;  /* allow use of regerror */
+		const char *errptr;
+		int erroff;
+		r->rule = pcre_compile(pat, 0, &errptr, &erroff, NULL);
+		if ( r->rule == NULL) {
+			logerr("invalid expression '%s' for match: %s\n",
+					pat, errptr);
+			return -1;  /* allow use of regerror */
+		}
+		r->rule_extra = pcre_study(r->rule, 0, &errptr);
+		pcre_fullinfo(r->rule, r->rule_extra, PCRE_INFO_CAPTURECOUNT, &re_nsub);
 		r->strmatch = NULL;
 		r->pattern = strdup(pat);
-		if (((flags & REG_NOSUB) == 0 && r->rule.re_nsub > 0) ||
-				flags & REG_FORCE)
+		if ((re_nsub > 0) || flags & REG_FORCE)
 		{
 			/* we need +1 because position 0 contains the entire
 			 * expression */
-			r->nmatch = r->rule.re_nsub + 1;
+			r->nmatch = re_nsub + 1;
 			if (r->nmatch > RE_MAX_MATCHES) {
 				logerr("determine_if_regex: too many match groups, "
 						"please increase RE_MAX_MATCHES in router.h\n");
@@ -1042,12 +1056,8 @@ router_readconfig(router *orig,
 					r->matchtype = MATCHALL;
 				} else {
 					int err = determine_if_regex(r, pat,
-							REG_EXTENDED | REG_NOSUB);
+							PCRE_NO_AUTO_CAPTURE);
 					if (err != 0) {
-						char ebuf[512];
-						regerror(err, &r->rule, ebuf, sizeof(ebuf));
-						logerr("invalid expression '%s' for match: %s\n",
-								pat, ebuf);
 						router_free(ret);
 						return NULL;
 					}
@@ -1120,12 +1130,8 @@ router_readconfig(router *orig,
 					d->cl->members.validation->rule = rule;
 
 					err = determine_if_regex(rule, pat,
-							REG_EXTENDED | REG_NOSUB);
+							PCRE_NO_AUTO_CAPTURE);
 					if (err != 0) {
-						char ebuf[512];
-						regerror(err, &rule->rule, ebuf, sizeof(ebuf));
-						logerr("invalid expression '%s' for validate: %s\n",
-								pat, ebuf);
 						router_free(ret);
 						return NULL;
 					}
@@ -1346,12 +1352,8 @@ router_readconfig(router *orig,
 				r->next = NULL;
 				if (m == NULL)
 					m = r;
-				err = determine_if_regex(r, pat, REG_EXTENDED);
+				err = determine_if_regex(r, pat, 0);
 				if (err != 0) {
-					char ebuf[512];
-					regerror(err, &r->rule, ebuf, sizeof(ebuf));
-					logerr("invalid expression '%s' "
-							"for aggregation: %s\n", pat, ebuf);
 					router_free(ret);
 					return NULL;
 				}
@@ -1792,11 +1794,8 @@ router_readconfig(router *orig,
 				return NULL;
 			}
 			r->next = NULL;
-			err = determine_if_regex(r, pat, REG_EXTENDED | REG_FORCE);
+			err = determine_if_regex(r, pat, REG_FORCE);
 			if (err != 0) {
-				char ebuf[512];
-				regerror(err, &r->rule, ebuf, sizeof(ebuf));
-				logerr("invalid expression '%s' for rewrite: %s\n", pat, ebuf);
 				router_free(ret);
 				return NULL;
 			}
@@ -2801,7 +2800,7 @@ router_metric_matches(
 		const route *r,
 		char *metric,
 		char *firstspace,
-		regmatch_t *pmatch)
+		int *ovector)
 {
 	char ret = 0;
 	char firstspc = *firstspace;
@@ -2812,7 +2811,7 @@ router_metric_matches(
 			break;
 		case REGEX:
 			*firstspace = '\0';
-			ret = regexec(&r->rule, metric, r->nmatch, pmatch, 0) == 0;
+			ret = (pcre_exec(r->rule, r->rule_extra, metric, strlen (metric), 0, 0, ovector, RE_MAX_MATCHES*3) >= 0);
 			*firstspace = firstspc;
 			break;
 		case CONTAINS:
@@ -2851,7 +2850,7 @@ router_rewrite_metric(
 		const char *firstspace,
 		const char *replacement,
 		const size_t nmatch,
-		const regmatch_t *pmatch)
+		int *pmatch)
 {
 	char escape = 0;
 	int ref = 0;
@@ -2865,7 +2864,7 @@ router_rewrite_metric(
 
 	/* insert leading part */
 	q = metric;
-	t = metric + pmatch[0].rm_so;
+	t = metric + pmatch[0];
 	if (s - *newmetric + t - q < sizeof(*newmetric)) {
 		while (q < t)
 			*s++ = *q++;
@@ -2894,11 +2893,11 @@ router_rewrite_metric(
 				} else {
 					if (escape) {
 						if (ref > 0 && ref <= nmatch
-								&& pmatch[ref].rm_so >= 0)
+								&& pmatch[2*ref] >= 0)
 						{
 							/* insert match part */
-							q = metric + pmatch[ref].rm_so;
-							t = metric + pmatch[ref].rm_eo;
+							q = metric + pmatch[2*ref];
+							t = metric + pmatch[2*ref+1];
 							if (s - *newmetric + t - q < sizeof(*newmetric)) {
 								switch (rcase) {
 									case RETAIN:
@@ -2934,7 +2933,7 @@ router_rewrite_metric(
 	s--;
 
 	/* insert remaining part */
-	q = metric + pmatch[0].rm_eo;
+	q = metric + pmatch[1];
 	t = firstspace;
 	if (s - *newmetric + t - q < sizeof(*newmetric)) {
 		while (q < t)
@@ -2980,7 +2979,7 @@ router_route_intern(
 	char newmetric[METRIC_BUFSIZ];
 	char *newfirstspace = NULL;
 	size_t len;
-	regmatch_t pmatch[RE_MAX_MATCHES];
+	int pmatch[RE_MAX_MATCHES*3];
 
 #define failif(RETLEN, WANTLEN) \
 	if (WANTLEN > RETLEN) { \
@@ -3236,7 +3235,7 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 	char newmetric[METRIC_BUFSIZ];
 	char *newfirstspace = NULL;
 	size_t len;
-	regmatch_t pmatch[RE_MAX_MATCHES];
+	int pmatch[3*RE_MAX_MATCHES];
 
 	for (w = routes; w != NULL; w = w->next) {
 		if (w->dests->cl->type == GROUP) {
