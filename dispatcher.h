@@ -54,6 +54,5 @@ void dispatch_accept_cb_exp(int fd, short ev, void *arg);
 void dispatch_accept_cb_noexp(int fd, short ev, void *arg);
 void dispatch_initlisteners(void);
 void dispatch_destroylisteners(void);
-void dispatch_initctype(char *c);
 
 #endif
